@@ -239,6 +239,47 @@ interface DependenciesVersions {
   }
 }
 
+type HealthIssueLevel = 'warning' | 'critical'
+type HealthStatus = 'healthy' | 'degraded' | 'unhealthy'
+
+interface HealthIssue {
+  key: string
+  level: HealthIssueLevel
+  message: string
+  value?: number
+}
+
+interface HealthPanel {
+  status: HealthStatus
+  timestamp: string
+  version: string
+  issues: HealthIssue[]
+  system: {
+    platform: string
+    arch: string
+    cpuCount: number
+    cpuModel: string | null
+    totalMemory: number
+    freeMemory: number
+    freeMemoryPercent: number | null
+  }
+  process: {
+    pid: number
+    uptimeSec: number
+    nodeVersion: string
+    memory: NodeJS.MemoryUsage
+    heapUsedPercent: number | null
+  }
+  network: {
+    counter: number
+    duration: number
+    active: number
+    syncing: number
+    start: number
+  } | null
+  shardusDependencies: DependenciesVersions
+}
+
 let shardusDependenciesVersions: DependenciesVersions = null
 
 function isDebugMode(): boolean {
@@ -430,7 +471,6 @@ export function setGenesisAccounts(accounts = []): void {
   genesisAccounts = accounts
 }
 
-
 function getShardusDependenciesVersions(){
   const isShardus = ([key, value] ) => key.startsWith('@shardus')
 
@@ -444,6 +484,84 @@ function getShardusDependenciesVersions(){
       })
   }
   return shardusDependenciesVersions
+}
+
+function buildHealthPanel(): HealthPanel {
+  const memoryUsage = process.memoryUsage()
+  const cpuInfo = cpus()
+  const totalMemory = totalmem()
+  const freeMemory = freemem()
+  const freeMemoryPercent = totalMemory > 0 ? Number(((freeMemory / totalMemory) * 100).toFixed(2)) : null
+  const heapUsedPercent =
+    memoryUsage.heapTotal > 0 ? Number(((memoryUsage.heapUsed / memoryUsage.heapTotal) * 100).toFixed(2)) : null
+  const latestCycles = shardus ? shardus.getLatestCycles(1) : []
+  const currentCycle = latestCycles[0]
+  const issues: HealthIssue[] = []
+
+  if (freeMemoryPercent !== null && freeMemoryPercent < 5) {
+    issues.push({
+      key: 'memory.free',
+      level: 'critical',
+      message: 'Free system memory is below 5%',
+      value: freeMemoryPercent,
+    })
+  }
+
+  if (heapUsedPercent !== null && heapUsedPercent > 90) {
+    issues.push({
+      key: 'memory.heap',
+      level: 'warning',
+      message: 'Process heap usage is above 90%',
+      value: heapUsedPercent,
+    })
+  }
+
+  if (!currentCycle) {
+    issues.push({
+      key: 'network.cycle',
+      level: 'warning',
+      message: 'Latest cycle data is not available yet',
+    })
+  }
+
+  const status: HealthStatus = issues.some((issue) => issue.level === 'critical')
+    ? 'unhealthy'
+    : issues.length > 0
+      ? 'degraded'
+      : 'healthy'
+
+  return {
+    status,
+    timestamp: new Date().toISOString(),
+    version,
+    issues,
+    system: {
+      platform: platform(),
+      arch: arch(),
+      cpuCount: cpuInfo.length,
+      cpuModel: cpuInfo[0]?.model ?? null,
+      totalMemory,
+      freeMemory,
+      freeMemoryPercent,
+    },
+    process: {
+      pid: process.pid,
+      uptimeSec: Number(process.uptime().toFixed(2)),
+      nodeVersion: process.version,
+      memory: memoryUsage,
+      heapUsedPercent,
+    },
+    network: currentCycle
+      ? {
+          counter: currentCycle.counter,
+          duration: currentCycle.duration,
+          active: currentCycle.active,
+          syncing: currentCycle.syncing,
+          start: currentCycle.start,
+        }
+      : null,
+    shardusDependencies: getShardusDependenciesVersions(),
+  }
 }
 
 /***
@@ -2339,9 +2457,10 @@ const configShardusEndpoints = (): void => {
   })
 
   shardus.registerExternalGet('is-healthy', async (req, res) => {
-    // TODO: Add actual health check logic
     nestedCountersInstance.countEvent('endpoint', 'health-check')
-    return res.sendStatus(200)
+    const healthPanel = buildHealthPanel()
+    const statusCode = healthPanel.status === 'unhealthy' ? 503 : 200
+    return res.status(statusCode).json(healthPanel)
   })
 }
 
